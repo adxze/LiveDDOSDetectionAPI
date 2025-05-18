@@ -24,7 +24,6 @@ RUN mkdir -p ./temp
 RUN touch model.pkl encoder.pkl scaler.pkl
 
 # Set environment variables
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1    
 
-# This is the critical part - using shell directly to evaluate $PORT at runtime
-CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"]
+CMD ["python", "main.py"]
