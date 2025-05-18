@@ -1,3 +1,4 @@
+
 FROM python:3.10-slim
 
 WORKDIR /app
@@ -20,14 +21,11 @@ COPY . .
 # Create temp directory
 RUN mkdir -p ./temp
 
-# Make sure we have mock models if they don't exist
+# Create mock models if they don't exist
 RUN touch model.pkl encoder.pkl scaler.pkl
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
-# Expose the application port - this is just documentation, Railway will override this
-EXPOSE 8000
-
-# Start the application
-CMD ["python", "main.py"]
+# This is the critical part - using shell directly to evaluate $PORT at runtime
+CMD ["sh", "-c", "python -m uvicorn main:app --host 0.0.0.0 --port $PORT"]
