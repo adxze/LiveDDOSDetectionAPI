@@ -1,7 +1,83 @@
-import os
+@app.get("/debug")
+async def debug_info():
+    """Provide detailed information for debugging model loading issues"""
+    # Get model file sizes and detailed info
+    model_path = Path("./model.pkl")
+    encoder_path = Path("./encoder.pkl")
+    scaler_path = Path("./scaler.pkl")
+    
+    model_info = {
+        "exists": model_path.exists(),
+        "size_bytes": model_path.stat().st_size if model_path.exists() else 0,
+        "loaded": model is not None,
+        "type": str(type(model)) if model is not None else "None"
+    }
+    
+    encoder_info = {
+        "exists": encoder_path.exists(),
+        "size_bytes": encoder_path.stat().st_size if encoder_path.exists() else 0,
+        "loaded": encoder is not None,
+        "type": str(type(encoder)) if encoder is not None else "None"
+    }
+    
+    scaler_info = {
+        "exists": scaler_path.exists(),
+        "size_bytes": scaler_path.stat().st_size if scaler_path.exists() else 0,
+        "loaded": scaler is not None,
+        "type": str(type(scaler)) if scaler is not None else "None"
+    }
+    
+    # Get more detailed environment info
+    try:
+        # Check for sklearn and joblib versions
+        import sklearn
+        joblib_version = joblib.__version__
+        sklearn_version = sklearn.__version__
+    except:
+        joblib_version = "unknown"
+        sklearn_version = "unknown"
+    
+    # Check write permissions
+    write_access = os.access('.', os.W_OK)
+    
+    # Check memory usage if psutil is available
+    memory_usage = {"error": "psutil not available"}
+    if psutil:
+        try:
+            process = psutil.Process(os.getpid())
+            memory_info = process.memory_info()
+            memory_usage = {
+                "rss_mb": memory_info.rss / (1024 * 1024),  # Convert to MB
+                "vms_mb": memory_info.vms / (1024 * 1024)   # Convert to MB
+            }
+        except Exception as e:
+            memory_usage = {"error": f"Could not get memory info: {str(e)}"}
+    
+    return {
+        "model": model_info,
+        "encoder": encoder_info,
+        "scaler": scaler_info,
+        "environment": {
+            "python_version": sys.version,
+            "sklearn_version": sklearn_version,
+            "joblib_version": joblib_version,
+            "write_access": write_access,
+            "memory_usage": memory_usage,
+            "pwd": os.getcwd(),
+            "files": os.listdir("."),
+            "temp_files": os.listdir(TEMP_DIR) if TEMP_DIR.exists() else []
+        },
+        "error_info": {
+            "tip1": "If model exists but not loaded, there might be compatibility issues with the model format",
+            "tip2": "If model doesn't exist, check Google Drive URLs and download logs",
+            "tip3": "If model exists but size is small, it might be a placeholder or corrupt file",
+            "tip4": "Try uploading model files directly using the /upload_model endpoint"
+        }
+    }"import os
 import logging
 import requests
 import sys
+import traceback
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader, APIKey
@@ -19,6 +95,13 @@ import socket
 import uuid
 import asyncio
 from datetime import datetime
+
+# Try to import psutil for memory monitoring
+try:
+    import psutil
+except ImportError:
+    # Not critical, so we'll just log it
+    psutil = None
 
 # Set up logging
 logging.basicConfig(
@@ -72,43 +155,86 @@ SCALER_DRIVE_URL = "https://drive.google.com/file/d/1NU1-XtorK4_3eWs6298tECI2ISN
 # Google Drive download function
 def download_file_from_google_drive(file_id, destination):
     """Download a file from Google Drive using its file ID"""
+    logger.info(f"Starting download from Google Drive: {file_id}")
+    
     # Handle both full URLs and file IDs
+    original_file_id = file_id
     if "drive.google.com" in file_id:
         # Extract file ID from URL
+        logger.info(f"Extracting file ID from URL: {file_id}")
         if "/file/d/" in file_id:
             file_id = file_id.split("/file/d/")[1].split("/")[0]
         elif "id=" in file_id:
             file_id = file_id.split("id=")[1].split("&")[0]
+        logger.info(f"Extracted file ID: {file_id}")
     
-    # The actual download URL
-    URL = "https://drive.google.com/uc?export=download"
-    
-    session = requests.Session()
-    
-    # First request to get cookies
-    response = session.get(URL, params={'id': file_id}, stream=True)
-    
-    # Check if there's a download warning for large files
-    for key, value in response.cookies.items():
-        if key.startswith('download_warning'):
-            # Add confirm param to avoid the warning page
-            params = {'id': file_id, 'confirm': value}
+    try:
+        # The actual download URL
+        URL = "https://drive.google.com/uc?export=download"
+        
+        session = requests.Session()
+        logger.info(f"Making initial request to: {URL}?id={file_id}")
+        
+        # First request to get cookies
+        response = session.get(URL, params={'id': file_id}, stream=True)
+        logger.info(f"Initial response status code: {response.status_code}")
+        
+        if response.status_code != 200:
+            logger.error(f"Failed to download: HTTP status {response.status_code}")
+            return False
+        
+        # Check if there's a download warning for large files
+        confirm_token = None
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                confirm_token = value
+                logger.info(f"Found download warning token: {confirm_token}")
+                break
+                
+        # If there's a warning token, make a second request with confirmation
+        if confirm_token:
+            logger.info(f"Making second request with confirmation token")
+            params = {'id': file_id, 'confirm': confirm_token}
             response = session.get(URL, params=params, stream=True)
-            break
-    
-    # Save the file
-    CHUNK_SIZE = 32768
-    with open(destination, "wb") as f:
-        for chunk in response.iter_content(CHUNK_SIZE):
-            if chunk:
-                f.write(chunk)
-    
-    # Verify the file was downloaded successfully
-    if os.path.exists(destination) and os.path.getsize(destination) > 0:
-        logger.info(f"Successfully downloaded {destination} ({os.path.getsize(destination)} bytes)")
-        return True
-    else:
-        logger.error(f"Failed to download {destination} or file is empty")
+            logger.info(f"Second response status code: {response.status_code}")
+            
+            if response.status_code != 200:
+                logger.error(f"Failed to download after confirmation: HTTP status {response.status_code}")
+                return False
+        
+        # Alternative approach using direct download URL 
+        if response.url.startswith("https://drive.google.com/file/d/"):
+            logger.info("Redirected to file view page, trying alternate method...")
+            # Try with another URL format
+            direct_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            logger.info(f"Trying direct URL: {direct_url}")
+            response = session.get(direct_url, stream=True)
+            
+            # Check for the Google Drive "virus scan" page
+            if "Google Drive - Virus scan warning" in response.text:
+                logger.info("Encountered virus scan page, trying to bypass...")
+                direct_url = f"https://drive.google.com/uc?export=download&id={file_id}&confirm=t"
+                response = session.get(direct_url, stream=True)
+        
+        # Save the file
+        logger.info(f"Saving file to: {destination}")
+        CHUNK_SIZE = 32768
+        with open(destination, "wb") as f:
+            for chunk in response.iter_content(CHUNK_SIZE):
+                if chunk:
+                    f.write(chunk)
+        
+        # Verify the file was downloaded successfully
+        if os.path.exists(destination) and os.path.getsize(destination) > 0:
+            logger.info(f"Successfully downloaded {destination} ({os.path.getsize(destination)} bytes)")
+            return True
+        else:
+            logger.error(f"Failed to download {destination} or file is empty")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Exception during download: {str(e)}")
+        logger.exception("Download exception details:")
         return False
 
 # Try to load or download models
@@ -118,12 +244,24 @@ try:
     ENCODER_PATH = Path("./encoder.pkl")
     SCALER_PATH = Path("./scaler.pkl")
     
+    # Log current directory and permissions
+    logger.info(f"Current working directory: {os.getcwd()}")
+    logger.info(f"Directory is writable: {os.access('.', os.W_OK)}")
+    logger.info(f"Model path exists: {MODEL_PATH.exists()}")
+    logger.info(f"Encoder path exists: {ENCODER_PATH.exists()}")
+    logger.info(f"Scaler path exists: {SCALER_PATH.exists()}")
+    
     # Check and download model if needed
     if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size < 1000:
         logger.info("Model file missing or too small. Downloading from Google Drive...")
         try:
-            download_file_from_google_drive(MODEL_DRIVE_URL, MODEL_PATH)
-            logger.info(f"Model downloaded successfully! Size: {MODEL_PATH.stat().st_size} bytes")
+            logger.info(f"Downloading model from: {MODEL_DRIVE_URL}")
+            success = download_file_from_google_drive(MODEL_DRIVE_URL, MODEL_PATH)
+            if success:
+                logger.info(f"Model downloaded successfully! Size: {MODEL_PATH.stat().st_size} bytes")
+            else:
+                logger.error("Failed to download model file from Google Drive")
+                raise Exception("Failed to download model file")
         except Exception as e:
             logger.error(f"Error downloading model: {str(e)}")
             raise
@@ -134,21 +272,36 @@ try:
     if not ENCODER_PATH.exists():
         logger.info("Encoder file missing. Downloading from Google Drive...")
         try:
-            download_file_from_google_drive(ENCODER_DRIVE_URL, ENCODER_PATH)
-            logger.info(f"Encoder downloaded successfully!")
+            logger.info(f"Downloading encoder from: {ENCODER_DRIVE_URL}")
+            success = download_file_from_google_drive(ENCODER_DRIVE_URL, ENCODER_PATH)
+            if success:
+                logger.info(f"Encoder downloaded successfully! Size: {ENCODER_PATH.stat().st_size} bytes")
+            else:
+                logger.error("Failed to download encoder file from Google Drive")
         except Exception as e:
             logger.error(f"Error downloading encoder: {str(e)}")
     
     if not SCALER_PATH.exists():
         logger.info("Scaler file missing. Downloading from Google Drive...")
         try:
-            download_file_from_google_drive(SCALER_DRIVE_URL, SCALER_PATH)
-            logger.info(f"Scaler downloaded successfully!")
+            logger.info(f"Downloading scaler from: {SCALER_DRIVE_URL}")
+            success = download_file_from_google_drive(SCALER_DRIVE_URL, SCALER_PATH)
+            if success:
+                logger.info(f"Scaler downloaded successfully! Size: {SCALER_PATH.stat().st_size} bytes")
+            else:
+                logger.error("Failed to download scaler file from Google Drive")
         except Exception as e:
             logger.error(f"Error downloading scaler: {str(e)}")
     
+    # Log file status after download attempts
+    logger.info(f"After download attempts - Model exists: {MODEL_PATH.exists()}, Size: {MODEL_PATH.stat().st_size if MODEL_PATH.exists() else 0} bytes")
+    logger.info(f"After download attempts - Encoder exists: {ENCODER_PATH.exists()}, Size: {ENCODER_PATH.stat().st_size if ENCODER_PATH.exists() else 0} bytes")
+    logger.info(f"After download attempts - Scaler exists: {SCALER_PATH.exists()}, Size: {SCALER_PATH.stat().st_size if SCALER_PATH.exists() else 0} bytes")
+    
     # Load the model
+    logger.info("Attempting to load model file...")
     model_data = joblib.load(MODEL_PATH)
+    logger.info(f"Model file loaded successfully. Type: {type(model_data)}")
     
     # Handle different model formats
     if isinstance(model_data, tuple) and len(model_data) == 2:
@@ -161,10 +314,12 @@ try:
     
     # Try to load encoder and scaler if they exist
     if ENCODER_PATH.exists():
+        logger.info("Attempting to load encoder file...")
         encoder = joblib.load(ENCODER_PATH)
         logger.info("Encoder loaded successfully!")
     
     if SCALER_PATH.exists():
+        logger.info("Attempting to load scaler file...")
         scaler = joblib.load(SCALER_PATH)
         logger.info("Scaler loaded successfully!")
     
@@ -174,6 +329,7 @@ try:
         
 except Exception as e:
     logger.error(f"Error loading ML components: {e}")
+    logger.exception("Stack trace:")
     # No mock fallback - system will report errors appropriately
 
 # Track ongoing captures
@@ -580,22 +736,70 @@ async def predict_csv_file(
         
         raise HTTPException(status_code=500, detail=error_msg)
 
-@app.get("/debug")
-async def debug_info():
-    # Return useful debugging information
-    return {
-        "environment": dict(os.environ),
-        "pwd": os.getcwd(),
-        "files": os.listdir("."),
-        "temp_files": os.listdir(TEMP_DIR) if TEMP_DIR.exists() else [],
-        "model_exists": Path("./model.pkl").exists(),
-        "encoder_exists": Path("./encoder.pkl").exists(),
-        "scaler_exists": Path("./scaler.pkl").exists(),
-        "model_loaded": model is not None,
-        "encoder_loaded": encoder is not None,
-        "scaler_loaded": scaler is not None,
-        "model_type": str(type(model)) if model is not None else "None",
-    }
+@app.post("/upload_model")
+async def upload_model_file(
+    file: UploadFile = File(...),
+    model_type: str = "model",  # can be "model", "encoder", or "scaler"
+    api_key: APIKey = Depends(get_api_key)
+):
+    """
+    Upload model files directly instead of downloading from Google Drive.
+    This is useful if Google Drive download is not working.
+    """
+    # Determine the file path based on model type
+    if model_type.lower() == "model":
+        file_path = Path("./model.pkl")
+    elif model_type.lower() == "encoder":
+        file_path = Path("./encoder.pkl")
+    elif model_type.lower() == "scaler":
+        file_path = Path("./scaler.pkl")
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid model type: {model_type}. Must be 'model', 'encoder', or 'scaler'")
+    
+    try:
+        # Save the uploaded file
+        contents = await file.read()
+        with open(file_path, "wb") as buffer:
+            buffer.write(contents)
+        
+        file_size = file_path.stat().st_size
+        logger.info(f"Uploaded {model_type} file successfully. Size: {file_size} bytes")
+        
+        if file_size < 1000:
+            return {
+                "success": False,
+                "message": f"File uploaded but seems too small ({file_size} bytes). It might be invalid."
+            }
+        
+        # Try to validate by loading (but don't actually replace the loaded model in memory)
+        try:
+            loaded_data = joblib.load(file_path)
+            if model_type.lower() == "model":
+                if isinstance(loaded_data, tuple) and len(loaded_data) == 2:
+                    logger.info("Verified model file with grid_search and label_encoders")
+                else:
+                    logger.info(f"Verified model file of type: {type(loaded_data).__name__}")
+            else:
+                logger.info(f"Verified {model_type} file of type: {type(loaded_data).__name__}")
+                
+            return {
+                "success": True,
+                "message": f"{model_type.capitalize()} file uploaded successfully ({file_size} bytes). Restart the API to use it.",
+                "file_path": str(file_path),
+                "file_type": str(type(loaded_data).__name__)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error validating the uploaded {model_type} file: {str(e)}")
+            return {
+                "success": False,
+                "message": f"File uploaded but failed validation. It may not be a valid {model_type} file: {str(e)}",
+                "file_path": str(file_path)
+            }
+    
+    except Exception as e:
+        logger.error(f"Error uploading {model_type} file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
 
 # Error handler
 @app.exception_handler(Exception)
@@ -618,7 +822,8 @@ async def api_documentation():
             "/detect": "Start real-time DDoS detection (POST, requires API key)",
             "/status/{capture_id}": "Get status of a detection job",
             "/predict_csv": "Upload CSV for prediction (POST, requires API key)",
-            "/debug": "Debug information for troubleshooting",
+            "/upload_model": "Upload model file directly (POST, requires API key)",
+            "/debug": "Detailed debugging information for troubleshooting",
             "/api/docs": "API documentation (this endpoint)"
         },
         "authentication": {
@@ -630,8 +835,21 @@ async def api_documentation():
                 }
             }
         },
-        "usage_example": {
-            "curl": 'curl -X POST "http://api-url/predict_csv" -H "X-API-Key: your-api-key" -F "file=@your-file.csv"'
+        "model_files": {
+            "description": "The API requires three ML model files to function:",
+            "model.pkl": "The main ML model for DDoS detection",
+            "encoder.pkl": "Categorical feature encoder",
+            "scaler.pkl": "Numerical feature scaler",
+            "notes": "If model download from Google Drive fails, you can upload them directly with /upload_model"
+        },
+        "usage_examples": {
+            "detect_ddos": 'curl -X POST "http://api-url/detect?interface=eth0&duration=60" -H "X-API-Key: your-api-key"',
+            "predict_csv": 'curl -X POST "http://api-url/predict_csv" -H "X-API-Key: your-api-key" -F "file=@your-file.csv"',
+            "upload_model": 'curl -X POST "http://api-url/upload_model?model_type=model" -H "X-API-Key: your-api-key" -F "file=@model.pkl"'
+        },
+        "troubleshooting": {
+            "model_not_available": "If you see 'ML model not available' errors, check /debug for detailed information",
+            "manual_upload": "Use /upload_model to manually upload model files if automatic download fails"
         }
     }
 
