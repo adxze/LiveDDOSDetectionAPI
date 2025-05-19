@@ -7,3 +7,4 @@ joblib>=1.2.0
 python-multipart>=0.0.6
 pydantic>=1.10.8
 pyshark>=0.5.3
+requests>=2.28.0
