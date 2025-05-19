@@ -671,5 +671,25 @@ async def get_status(capture_id: str):
     if capture_id not in detection_tasks:
         # Check database for this capture
         db = SessionLocal()
+        # Use a simpler query without the desc() function
         query = db.query(DetectionResult).filter(DetectionResult.capture_id == capture_id).order_by(
-            sqlalchemy.desc(DetectionResult.timestamp
+            DetectionResult.timestamp.desc()).first()
+        
+        if query:
+            # Convert database result to status response
+            result_data = json.loads(query.result_data) if query.result_data else None
+            return StatusResponse(
+                status=query.status,
+                message=f"Task status: {query.status}",
+                result_counts={"Normal": query.normal_count, "Intrusion": query.intrusion_count},
+                progress=100 if query.status == "completed" else 0
+            )
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    task = detection_tasks[capture_id]
+    return StatusResponse(
+        status=task["status"],
+        message=task["message"],
+        result_counts=task["result_counts"],
+        progress=task["progress"]
+    )
