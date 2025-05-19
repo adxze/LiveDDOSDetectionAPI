@@ -18,6 +18,14 @@ from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 
+# New imports for database
+import sqlalchemy
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, JSON, Float, Text, Boolean, func
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime, timedelta
+import databases
+
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -43,6 +51,37 @@ api_key_header = APIKeyHeader(name="X-API-Key")
 # Dictionary to track ongoing detection tasks
 detection_tasks = {}
 
+# Database configuration
+DATABASE_URL = os.environ.get("DATABASE_URL", "").replace("postgres://", "postgresql://")
+if not DATABASE_URL:
+    logger.warning("No DATABASE_URL environment variable found. Using SQLite database.")
+    DATABASE_URL = "sqlite:///./diddysec.db"
+
+# SQLAlchemy setup
+database = databases.Database(DATABASE_URL)
+Base = declarative_base()
+
+# Define database models
+class DetectionResult(Base):
+    __tablename__ = "detection_results"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    capture_id = Column(String, unique=True, index=True)
+    hostname = Column(String)
+    location = Column(String)
+    timestamp = Column(DateTime, default=datetime.utcnow)
+    status = Column(String)
+    normal_count = Column(Integer, default=0)
+    intrusion_count = Column(Integer, default=0)
+    os = Column(String)
+    result_json = Column(sqlalchemy.JSON)
+    is_critical = Column(Boolean, default=False)
+
+# Initialize database engine
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(bind=engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 app = FastAPI(title="DDoS Detection API", description="API for detecting DDoS attacks in network traffic")
 
 # Add CORS middleware to allow requests from your frontend
@@ -54,11 +93,84 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Function to clean up old data (older than 24 hours)
+async def cleanup_old_data():
+    while True:
+        try:
+            logger.info("Running scheduled cleanup of old detection data")
+            one_day_ago = datetime.utcnow() - timedelta(days=1)
+            
+            # Proper SQL query for databases package
+            query = "DELETE FROM detection_results WHERE timestamp < :old_time"
+            await database.execute(query=query, values={"old_time": one_day_ago})
+            
+            logger.info("Cleanup completed")
+        except Exception as e:
+            logger.error(f"Error during cleanup: {str(e)}")
+        
+        # Run cleanup every 6 hours
+        await asyncio.sleep(6 * 60 * 60)  # 6 hours in seconds
+
 # API key validation dependency
 async def verify_api_key(api_key: str = Depends(api_key_header)):
     if api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid API key")
     return api_key
+
+# Modified function to save results to database
+async def save_detection_result(capture_id, metadata, result_counts):
+    try:
+        is_critical = False
+        if result_counts and "Intrusion" in result_counts and "Normal" in result_counts:
+            total = result_counts["Intrusion"] + result_counts["Normal"]
+            if total > 0 and (result_counts["Intrusion"] / total) > 0.2:
+                is_critical = True
+        
+        # Create query for databases package
+        query = """
+        INSERT INTO detection_results (
+            capture_id, hostname, location, timestamp, status,
+            normal_count, intrusion_count, os, result_json, is_critical
+        ) VALUES (
+            :capture_id, :hostname, :location, :timestamp, :status,
+            :normal_count, :intrusion_count, :os, :result_json, :is_critical
+        )
+        """
+        
+        values = {
+            "capture_id": capture_id,
+            "hostname": metadata.get("hostname", "unknown"),
+            "location": metadata.get("location", "unknown"),
+            "timestamp": datetime.utcnow(),
+            "status": "completed",
+            "normal_count": result_counts.get("Normal", 0),
+            "intrusion_count": result_counts.get("Intrusion", 0),
+            "os": metadata.get("os", "unknown"),
+            "result_json": result_counts,
+            "is_critical": is_critical
+        }
+        
+        await database.execute(query=query, values=values)
+        logger.info(f"Detection result for {capture_id} saved to database")
+    
+    except Exception as e:
+        logger.error(f"Error saving to database: {str(e)}")
+
+# Pydantic models for API requests/responses
+class DetectionRequest(BaseModel):
+    interface: str
+    duration: int = 30
+
+class DetectionResponse(BaseModel):
+    capture_id: str
+    message: str
+    status: str = "started"
+
+class StatusResponse(BaseModel):
+    status: str
+    message: str
+    result_counts: Optional[Dict[str, int]] = None
+    progress: Optional[int] = None
 
 # Download model files at startup
 async def download_models():
@@ -83,23 +195,7 @@ async def download_models():
         logger.error(f"Error downloading models: {str(e)}")
         raise
 
-# Pydantic models for API requests/responses
-class DetectionRequest(BaseModel):
-    interface: str
-    duration: int = 30
-
-class DetectionResponse(BaseModel):
-    capture_id: str
-    message: str
-    status: str = "started"
-
-class StatusResponse(BaseModel):
-    status: str
-    message: str
-    result_counts: Optional[Dict[str, int]] = None
-    progress: Optional[int] = None
-
-# Live capture function (adapted from your original code)
+# Live capture function
 async def live_capture_flow_features(interface, csv_file, capture_id, duration=60):
     try:
         logger.info(f"Starting live capture on interface {interface} for {duration} seconds")
@@ -200,7 +296,7 @@ async def live_capture_flow_features(interface, csv_file, capture_id, duration=6
                             elif flags & 0x10:
                                 flow['state'] = 'CON'
                             
-                            # Komunikasi dua arah?
+                            # Check for two-way communication
                             dir_str = f"{src_ip}:{src_port}->{dst_ip}:{dst_port}"
                             flow['packet_directions'].add(dir_str)
                             reverse_dir = f"{dst_ip}:{dst_port}->{src_ip}:{src_port}"
@@ -266,8 +362,8 @@ async def live_capture_flow_features(interface, csv_file, capture_id, duration=6
         logger.error(f"Error in live capture: {str(e)}")
         raise
 
-# Prediction function based on your original code
-async def predict_from_csv(model_path, encoder_path, scaler_path, csv_path, capture_id):
+# Updated predict_from_csv function to save results to the database
+async def predict_from_csv(model_path, encoder_path, scaler_path, csv_path, capture_id, metadata=None):
     try:
         # Update task status
         detection_tasks[capture_id]["status"] = "analyzing"
@@ -331,6 +427,11 @@ async def predict_from_csv(model_path, encoder_path, scaler_path, csv_path, capt
         # Update task status with results
         detection_tasks[capture_id]["result_counts"] = result_counts
         
+        # Save results to the database
+        if metadata is None:
+            metadata = {}
+        await save_detection_result(capture_id, metadata, result_counts)
+        
         logger.info(f"Prediction completed with results: {result_counts}")
         return result_counts
         
@@ -362,16 +463,16 @@ async def live_capture_task(capture_id: str, interface: str, duration: int):
         detection_tasks[capture_id]["status"] = "error"
         detection_tasks[capture_id]["message"] = f"Error: {str(e)}"
 
-# Analyze an uploaded CSV file
-async def analyze_csv_task(capture_id: str, file_path: str):
+# Updated analyze_csv_task to use metadata
+async def analyze_csv_task(capture_id: str, file_path: str, metadata: dict = None):
     try:
         # Update task status
         detection_tasks[capture_id]["status"] = "processing"
         detection_tasks[capture_id]["message"] = "Processing uploaded CSV..."
         detection_tasks[capture_id]["progress"] = 50
         
-        # Process the CSV file with our model
-        await predict_from_csv(MODEL_PATH, ENCODER_PATH, SCALER_PATH, file_path, capture_id)
+        # Process the CSV file with our model and pass metadata
+        await predict_from_csv(MODEL_PATH, ENCODER_PATH, SCALER_PATH, file_path, capture_id, metadata)
         
         # Update completion status
         detection_tasks[capture_id]["status"] = "completed"
@@ -389,6 +490,13 @@ async def analyze_csv_task(capture_id: str, file_path: str):
 @app.on_event("startup")
 async def startup_event():
     await download_models()
+    await database.connect()
+    # Setup periodic clean up task
+    asyncio.create_task(cleanup_old_data())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await database.disconnect()
 
 @app.post("/detect", response_model=DetectionResponse, dependencies=[Depends(verify_api_key)])
 async def start_detection(request: DetectionRequest, background_tasks: BackgroundTasks):
@@ -416,7 +524,13 @@ async def start_detection(request: DetectionRequest, background_tasks: Backgroun
     )
 
 @app.post("/predict_csv", dependencies=[Depends(verify_api_key)])
-async def predict_csv(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def predict_csv(
+    background_tasks: BackgroundTasks, 
+    file: UploadFile = File(...),
+    hostname: str = None,
+    location: str = None,
+    os: str = None
+):
     # Generate a unique ID for this task
     capture_id = str(uuid.uuid4())
     
@@ -438,8 +552,21 @@ async def predict_csv(background_tasks: BackgroundTasks, file: UploadFile = File
             content = await file.read()
             await f.write(content)
         
-        # Start analysis in background
-        background_tasks.add_task(analyze_csv_task, capture_id, temp_file)
+        # Create metadata dict
+        metadata = {
+            "hostname": hostname or "unknown",
+            "location": location or "unknown",
+            "os": os or "unknown",
+            "capture_time": datetime.utcnow().isoformat()
+        }
+        
+        # Start analysis in background with metadata
+        background_tasks.add_task(
+            analyze_csv_task, 
+            capture_id, 
+            temp_file,
+            metadata
+        )
         
         return {"capture_id": capture_id, "message": "CSV analysis started", "status": "started"}
     
@@ -459,6 +586,92 @@ async def get_status(capture_id: str):
         result_counts=task["result_counts"],
         progress=task["progress"]
     )
+
+@app.get("/results", dependencies=[Depends(verify_api_key)])
+async def get_results(
+    limit: int = 100, 
+    critical_only: bool = False,
+    hostname: Optional[str] = None
+):
+    """Get detection results from the database with optional filtering"""
+    try:
+        # Build the query
+        query = "SELECT * FROM detection_results WHERE 1=1"
+        params = {}
+        
+        if critical_only:
+            query += " AND is_critical = :critical"
+            params["critical"] = True
+            
+        if hostname:
+            query += " AND hostname = :hostname"
+            params["hostname"] = hostname
+            
+        # Add order and limit
+        query += " ORDER BY timestamp DESC LIMIT :limit"
+        params["limit"] = limit
+        
+        # Execute query
+        results = await database.fetch_all(query=query, values=params)
+        
+        # Convert to list of dicts
+        return [dict(result) for result in results]
+        
+    except Exception as e:
+        logger.error(f"Error fetching results: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+
+@app.get("/stats", dependencies=[Depends(verify_api_key)])
+async def get_statistics():
+    """Get overall statistics of detections"""
+    try:
+        # Get count of all results
+        total_query = "SELECT COUNT(*) as total FROM detection_results"
+        total_result = await database.fetch_one(total_query)
+        
+        # Get count of critical detections
+        critical_query = "SELECT COUNT(*) as critical FROM detection_results WHERE is_critical = true"
+        critical_result = await database.fetch_one(critical_query)
+        
+        # Get stats by time period (last 24 hours)
+        timeperiod_query = """
+        SELECT 
+            SUM(normal_count) as total_normal,
+            SUM(intrusion_count) as total_intrusion
+        FROM detection_results 
+        WHERE timestamp > :day_ago
+        """
+        day_ago = datetime.utcnow() - timedelta(days=1)
+        timeperiod_result = await database.fetch_one(
+            timeperiod_query, 
+            values={"day_ago": day_ago}
+        )
+        
+        # Get hostname statistics
+        hostname_query = """
+        SELECT hostname, COUNT(*) as count 
+        FROM detection_results 
+        GROUP BY hostname 
+        ORDER BY count DESC
+        """
+        hostname_results = await database.fetch_all(hostname_query)
+        
+        return {
+            "total_detections": total_result["total"] if total_result else 0,
+            "critical_detections": critical_result["critical"] if critical_result else 0,
+            "last_24h": {
+                "normal": timeperiod_result["total_normal"] if timeperiod_result else 0,
+                "intrusion": timeperiod_result["total_intrusion"] if timeperiod_result else 0
+            },
+            "hosts": [
+                {"hostname": result["hostname"], "count": result["count"]} 
+                for result in hostname_results
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting statistics: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
