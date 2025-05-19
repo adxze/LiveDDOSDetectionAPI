@@ -64,6 +64,11 @@ encoder = None
 scaler = None
 label_encoders = {}
 
+# Google Drive file URLs from your shared links
+MODEL_DRIVE_URL = "https://drive.google.com/file/d/1A5qsfi1fF-SKmQfeDn3_-57qchSVsgt6/view?usp=sharing"
+ENCODER_DRIVE_URL = "https://drive.google.com/file/d/1sN4XIfQrVvbiFQycXgSeIMOZ_sjlaMKH/view?usp=sharing"
+SCALER_DRIVE_URL = "https://drive.google.com/file/d/1NU1-XtorK4_3eWs6298tECI2ISNSaUAF/view?usp=sharing"
+
 # Google Drive download function
 def download_file_from_google_drive(file_id, destination):
     """Download a file from Google Drive using its file ID"""
@@ -112,11 +117,6 @@ try:
     MODEL_PATH = Path("./model.pkl")
     ENCODER_PATH = Path("./encoder.pkl")
     SCALER_PATH = Path("./scaler.pkl")
-    
-    # Google Drive file IDs - replace these with your actual file IDs
-    MODEL_DRIVE_ID = "1uG8OB_mRvt56qO1V8DmaApAn2y6BuGEG"  # Example from your second code
-    ENCODER_DRIVE_ID = "your-encoder-file-id"  # Replace with actual ID
-    SCALER_DRIVE_ID = "your-scaler-file-id"    # Replace with actual ID
     
     # Check and download model if needed
     if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size < 1000:
