@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import uuid
@@ -146,7 +147,7 @@ async def save_detection_result(capture_id, metadata, result_counts):
             "normal_count": result_counts.get("Normal", 0),
             "intrusion_count": result_counts.get("Intrusion", 0),
             "os": metadata.get("os", "unknown"),
-            "result_json": result_counts,
+            "result_json": json.dumps(result_counts),  # Convert dict to JSON string,
             "is_critical": is_critical
         }
         
