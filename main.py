@@ -184,7 +184,7 @@ async def capture_network_traffic(capture_id: str, interface: str, duration: int
         df        = pd.read_csv(csv_file)
         flow_data = df.copy()
         proc      = df.drop(['src_ip','dst_ip','protocol','src_port','dst_port'], axis=1)
-        proc[['state']] = encoder.transform(proc[['state']])
+        proc['state'] = encoder.transform(proc['state'])
         feats           = ['state','sttl','ct_state_ttl','dload','ct_dst_sport_ltm','rate','swin','dwin','dmean','ct_src_dport_ltm']
         proc[feats]     = scaler.transform(proc[feats])
         preds           = model.predict(proc[feats])
