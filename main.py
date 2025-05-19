@@ -181,47 +181,46 @@ def extract_flows(packets: List[pyshark.packet.packet.Packet]):
 
 async def capture_network_traffic(capture_id: str, interface: str, duration: int):
     active_captures[capture_id] = {"status": "running", "start_time": time.time()}
-    csv_file = TEMP_DIR/f"{capture_id}_flows.csv"
+    csv_file       = TEMP_DIR / f"{capture_id}_flows.csv"
+    predicted_file = TEMP_DIR / f"{capture_id}_predicted.csv"
+
     try:
+        # ←— here’s the only change:
         cap = pyshark.LiveCapture(interface=interface)
-        packets = []
-        start = time.time()
-        for pkt in cap.sniff_continuously():
-            if time.time() - start > duration:
-                break
-            packets.append(pkt)
+        cap.sniff(timeout=duration)       # block for `duration` seconds
+        packets = list(cap)               # collect captured packets
         cap.close()
 
-        # build DataFrame of flows
+        # now extract flows & features as before
         df = extract_flows(packets)
         df.to_csv(csv_file, index=False)
 
-        # preprocess & predict
+        # …the rest of your preprocessing & prediction…
         proc = df.drop(["src_ip","dst_ip","protocol","src_port","dst_port"], axis=1)
         proc["state"] = encoder.transform(proc["state"])
         feats = ["state","sttl","ct_state_ttl","dload","ct_dst_sport_ltm",
                  "rate","swin","dwin","dmean","ct_src_dport_ltm"]
         proc[feats] = scaler.transform(proc[feats])
-
         preds = model.predict(proc[feats])
+
         df["prediction"] = preds
-        df["label"] = df["prediction"].map({0:"Normal",1:"Intrusion"})
-        df.to_csv(TEMP_DIR/f"{capture_id}_predicted.csv", index=False)
+        df["label"]      = df["prediction"].map({0:"Normal",1:"Intrusion"})
+        df.to_csv(predicted_file, index=False)
 
         counts = df["label"].value_counts().to_dict()
         active_captures[capture_id].update({
-            "status": "completed",
-            "result_counts": counts,
-            "end_time": time.time(),
-            "prediction_file": str(TEMP_DIR/f"{capture_id}_predicted.csv")
+            "status":          "completed",
+            "result_counts":   counts,
+            "end_time":        time.time(),
+            "prediction_file": str(predicted_file)
         })
         logger.info(f"Capture {capture_id} done: {counts}")
 
     except Exception as e:
         active_captures[capture_id] = {
-            "status":"error",
-            "message":str(e),
-            "end_time":time.time()
+            "status":    "error",
+            "message":   str(e),
+            "end_time":  time.time()
         }
         logger.exception(f"Capture {capture_id} failed")
 
