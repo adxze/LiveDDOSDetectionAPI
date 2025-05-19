@@ -17,5 +17,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY . .
 
-# Command to run the application
-CMD uvicorn main:app --host 0.0.0.0 --port $(echo $PORT | tr -d '"')
+# Make the startup script executable
+COPY startup.sh /app/startup.sh
+RUN chmod +x /app/startup.sh
+
+# Command to run the application using the startup script
+CMD ["/app/startup.sh"]
