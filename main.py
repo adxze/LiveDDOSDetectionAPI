@@ -1,11 +1,15 @@
 import os
 import logging
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+import requests
+import sys
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader, APIKey
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import Dict, List, Optional, Union
 import pandas as pd
+import numpy as np
 import joblib
 import time
 import subprocess
@@ -26,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 # Log environment for debugging
 logger.info(f"Environment variables: PORT={os.environ.get('PORT', 'not set')}")
+logger.info(f"Python version: {sys.version}")
+logger.info(f"Current directory: {os.getcwd()}")
+logger.info(f"Files in current directory: {os.listdir('.')}")
 
 # API configuration
 API_KEY = os.getenv("API_KEY", "your-api-key")
@@ -55,25 +62,119 @@ TEMP_DIR.mkdir(exist_ok=True)
 model = None
 encoder = None
 scaler = None
+label_encoders = {}
 
-# Load the real models - will fail if not available (no mock fallback)
+# Google Drive download function
+def download_file_from_google_drive(file_id, destination):
+    """Download a file from Google Drive using its file ID"""
+    # Handle both full URLs and file IDs
+    if "drive.google.com" in file_id:
+        # Extract file ID from URL
+        if "/file/d/" in file_id:
+            file_id = file_id.split("/file/d/")[1].split("/")[0]
+        elif "id=" in file_id:
+            file_id = file_id.split("id=")[1].split("&")[0]
+    
+    # The actual download URL
+    URL = "https://drive.google.com/uc?export=download"
+    
+    session = requests.Session()
+    
+    # First request to get cookies
+    response = session.get(URL, params={'id': file_id}, stream=True)
+    
+    # Check if there's a download warning for large files
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            # Add confirm param to avoid the warning page
+            params = {'id': file_id, 'confirm': value}
+            response = session.get(URL, params=params, stream=True)
+            break
+    
+    # Save the file
+    CHUNK_SIZE = 32768
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(CHUNK_SIZE):
+            if chunk:
+                f.write(chunk)
+    
+    # Verify the file was downloaded successfully
+    if os.path.exists(destination) and os.path.getsize(destination) > 0:
+        logger.info(f"Successfully downloaded {destination} ({os.path.getsize(destination)} bytes)")
+        return True
+    else:
+        logger.error(f"Failed to download {destination} or file is empty")
+        return False
+
+# Try to load or download models
 try:
     logger.info("Attempting to load ML components...")
     MODEL_PATH = Path("./model.pkl")
     ENCODER_PATH = Path("./encoder.pkl")
     SCALER_PATH = Path("./scaler.pkl")
     
-    if MODEL_PATH.exists() and ENCODER_PATH.exists() and SCALER_PATH.exists():
-        model = joblib.load(MODEL_PATH)
-        encoder = joblib.load(ENCODER_PATH)
-        scaler = joblib.load(SCALER_PATH)
-        logger.info("ML model and components loaded successfully")
+    # Google Drive file IDs - replace these with your actual file IDs
+    MODEL_DRIVE_ID = "1uG8OB_mRvt56qO1V8DmaApAn2y6BuGEG"  # Example from your second code
+    ENCODER_DRIVE_ID = "your-encoder-file-id"  # Replace with actual ID
+    SCALER_DRIVE_ID = "your-scaler-file-id"    # Replace with actual ID
+    
+    # Check and download model if needed
+    if not MODEL_PATH.exists() or MODEL_PATH.stat().st_size < 1000:
+        logger.info("Model file missing or too small. Downloading from Google Drive...")
+        try:
+            download_file_from_google_drive(MODEL_DRIVE_URL, MODEL_PATH)
+            logger.info(f"Model downloaded successfully! Size: {MODEL_PATH.stat().st_size} bytes")
+        except Exception as e:
+            logger.error(f"Error downloading model: {str(e)}")
+            raise
     else:
-        logger.error("Required model files not found. Please ensure model.pkl, encoder.pkl, and scaler.pkl exist.")
-        # Don't fall back to mock models
+        logger.info(f"model.pkl exists! Size: {MODEL_PATH.stat().st_size} bytes")
+        
+    # Similarly for encoder and scaler if needed
+    if not ENCODER_PATH.exists():
+        logger.info("Encoder file missing. Downloading from Google Drive...")
+        try:
+            download_file_from_google_drive(ENCODER_DRIVE_URL, ENCODER_PATH)
+            logger.info(f"Encoder downloaded successfully!")
+        except Exception as e:
+            logger.error(f"Error downloading encoder: {str(e)}")
+    
+    if not SCALER_PATH.exists():
+        logger.info("Scaler file missing. Downloading from Google Drive...")
+        try:
+            download_file_from_google_drive(SCALER_DRIVE_URL, SCALER_PATH)
+            logger.info(f"Scaler downloaded successfully!")
+        except Exception as e:
+            logger.error(f"Error downloading scaler: {str(e)}")
+    
+    # Load the model
+    model_data = joblib.load(MODEL_PATH)
+    
+    # Handle different model formats
+    if isinstance(model_data, tuple) and len(model_data) == 2:
+        grid_search, label_encoders = model_data
+        model = grid_search.best_estimator_
+        logger.info(f"Model loaded successfully! Type: {type(model).__name__}")
+    else:
+        model = model_data
+        logger.info(f"Model loaded successfully! Type: {type(model).__name__}")
+    
+    # Try to load encoder and scaler if they exist
+    if ENCODER_PATH.exists():
+        encoder = joblib.load(ENCODER_PATH)
+        logger.info("Encoder loaded successfully!")
+    
+    if SCALER_PATH.exists():
+        scaler = joblib.load(SCALER_PATH)
+        logger.info("Scaler loaded successfully!")
+    
+    # If no real encoder/scaler but we have a model
+    if model is not None and (encoder is None or scaler is None):
+        logger.warning("Using internal preprocessing with label encoders instead of separate encoder/scaler")
+        
 except Exception as e:
     logger.error(f"Error loading ML components: {e}")
-    # Don't fall back to mock models
+    # No mock fallback - system will report errors appropriately
 
 # Track ongoing captures
 active_captures = {}
@@ -130,6 +231,40 @@ def get_available_interfaces():
         logger.error(f"Error getting network interfaces: {e}")
         return []
 
+# Preprocess data based on the second file's implementation
+def preprocess_data(df):
+    """
+    Preprocess data to match the format expected by the model
+    """
+    try:
+        # Handle categorical columns with label encoding
+        for col in df.select_dtypes(include=['object']).columns:
+            if col in label_encoders:
+                # Handle unknown categories
+                df[col] = df[col].astype(str)
+                for val in df[col].unique():
+                    if val not in label_encoders[col].classes_:
+                        label_encoders[col].classes_ = np.append(label_encoders[col].classes_, val)
+                df[col] = label_encoders[col].transform(df[col])
+            else:
+                df[col] = 0
+                
+        # Apply log transformations as your model was trained with
+        if 'dload' in df.columns:
+            df['dload'] = np.log1p(df['dload'])
+            
+        if 'ct_dst_sport_ltm' in df.columns:
+            df['ct_dst_sport_ltm'] = np.log1p(df['ct_dst_sport_ltm'])
+            
+        if 'dmean' in df.columns:
+            df['dmean'] = np.log1p(df['dmean'])
+        
+        return df
+    except Exception as e:
+        error_msg = f"Error preprocessing data: {str(e)}"
+        logger.error(f"ERROR: {error_msg}")
+        raise Exception(error_msg)
+
 # Function to capture network traffic
 async def capture_network_traffic(capture_id: str, interface: str, duration: int):
     try:
@@ -166,13 +301,13 @@ async def capture_network_traffic(capture_id: str, interface: str, duration: int
         await asyncio.sleep(min(duration, 5))  # Cap at 5s for demo
         
         # Check if the ML model is available
-        if model is None or encoder is None or scaler is None:
+        if model is None:
             active_captures[capture_id] = {
                 "status": "error",
-                "message": "ML model components not available. Cannot perform prediction.",
+                "message": "ML model not available. Cannot perform prediction.",
                 "end_time": time.time()
             }
-            logger.error(f"Capture {capture_id} failed: ML model components not available")
+            logger.error(f"Capture {capture_id} failed: ML model not available")
             return
         
         # Now predict using the model
@@ -182,19 +317,22 @@ async def capture_network_traffic(capture_id: str, interface: str, duration: int
         # Save a copy of the raw data before preprocessing
         flow_data = df.copy()
         
-        # Preprocess the data
-        df_processed = df.drop(['src_ip', 'dst_ip', 'protocol', 'src_port', 'dst_port'], axis=1)
-        
-        # Encode categorical features
-        df_processed['state'] = encoder.transform(df_processed['state'])
-        
-        # Scale numerical features
-        features = ['state', 'sttl', 'ct_state_ttl', 'dload', 'ct_dst_sport_ltm', 
-                   'rate', 'swin', 'dwin', 'dmean', 'ct_src_dport_ltm']
-        df_processed[features] = scaler.transform(df_processed[features])
+        # Preprocess the data - use either encoder/scaler or label_encoders approach
+        if encoder is not None and scaler is not None:
+            # Preprocess the data using encoder/scaler approach
+            df_processed = df.drop(['src_ip', 'dst_ip', 'protocol', 'src_port', 'dst_port'], axis=1)
+            df_processed['state'] = encoder.transform(df_processed['state'])
+            features = ['state', 'sttl', 'ct_state_ttl', 'dload', 'ct_dst_sport_ltm', 
+                      'rate', 'swin', 'dwin', 'dmean', 'ct_src_dport_ltm']
+            df_processed[features] = scaler.transform(df_processed[features])
+        else:
+            # Use the preprocess_data function with label_encoders
+            # Drop unnecessary columns if they exist
+            df_processed = df.drop(['src_ip', 'dst_ip', 'protocol', 'src_port', 'dst_port'], axis=1)
+            df_processed = preprocess_data(df_processed)
         
         # Make predictions
-        predictions = model.predict(df_processed[features])
+        predictions = model.predict(df_processed)
         
         # Add predictions to the original data
         flow_data['prediction'] = predictions
@@ -229,15 +367,19 @@ async def capture_network_traffic(capture_id: str, interface: str, duration: int
 # API Endpoints
 @app.get("/")
 async def root():
-    return {"message": "DiddySec DDoS Detection API", "version": "1.0.0"}
+    return {
+        "message": "DiddySec DDoS Detection API", 
+        "version": "1.0.0",
+        "model_loaded": model is not None
+    }
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     interfaces = get_available_interfaces()
     return {
-        "status": "ok" if (model is not None and encoder is not None and scaler is not None) else "error",
+        "status": "ok" if model is not None else "error",
         "time": datetime.now().isoformat(),
-        "model_loaded": model is not None and encoder is not None and scaler is not None,
+        "model_loaded": model is not None,
         "interface_available": len(interfaces) > 0
     }
 
@@ -254,10 +396,10 @@ async def start_detection(
     api_key: APIKey = Depends(get_api_key)
 ):
     # Check if ML models are available
-    if model is None or encoder is None or scaler is None:
+    if model is None:
         raise HTTPException(
             status_code=503,
-            detail="ML model components not available. Cannot start detection."
+            detail="ML model not available. Cannot start detection."
         )
     
     # Generate a unique ID for this capture
@@ -326,36 +468,117 @@ async def get_status(
             "message": capture_info.get("message", "Unknown error")
         }
 
-# Simplified CSV prediction endpoint
 @app.post("/predict_csv")
-async def predict_csv_file(request: Request, api_key: APIKey = Depends(get_api_key)):
+async def predict_csv_file(
+    file: UploadFile = File(...),
+    api_key: APIKey = Depends(get_api_key)
+):
     # Check if ML models are available
-    if model is None or encoder is None or scaler is None:
+    if model is None:
         raise HTTPException(
             status_code=503,
-            detail="ML model components not available. Cannot perform prediction."
+            detail="ML model not available. Cannot perform prediction."
         )
     
-    # This would be implemented with a proper file upload
-    # For demo purposes, add some logic to simulate processing
-    await asyncio.sleep(2)
+    # Validate file type
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(status_code=400, detail="Only CSV files are allowed")
     
-    # In a real implementation, you would:
-    # 1. Save the uploaded file
-    # 2. Read it with pandas
-    # 3. Preprocess it
-    # 4. Make predictions
-    # 5. Return results
+    # Limit file size (10MB)
+    MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
     
-    # Since we've removed the mock models, this should only run if real models are loaded
-    return {
-        "status": "completed",
-        "message": "Prediction completed using real ML model",
-        "result_counts": {
-            "Normal": 462,
-            "Intrusion": 96
+    try:
+        # Read file with size limit
+        contents = await file.read()
+        if len(contents) > MAX_FILE_SIZE:
+            raise HTTPException(status_code=400, detail="File too large. Maximum size is 10MB")
+        
+        # Save the uploaded file temporarily
+        temp_file = TEMP_DIR / f"temp_{file.filename}"
+        with open(temp_file, "wb") as buffer:
+            buffer.write(contents)
+        
+        # Read the CSV
+        df = pd.read_csv(temp_file)
+        logger.info(f"Loaded CSV with shape: {df.shape}")
+        
+        # Drop unnecessary columns if they exist
+        df = df.drop(['id', 'attack_cat'], axis=1, errors='ignore')
+        
+        # Prepare features
+        X = df.copy()
+        if 'label' in X.columns:
+            y_true = X['label'].copy()
+            X = X.drop('label', axis=1)
+        else:
+            y_true = None
+        
+        # Preprocess the data - use either encoder/scaler or label_encoders approach
+        if encoder is not None and scaler is not None:
+            # Preprocess the data using encoder/scaler approach
+            X_processed = X.drop(['src_ip', 'dst_ip', 'protocol', 'src_port', 'dst_port'], axis=1, errors='ignore')
+            if 'state' in X_processed.columns:
+                X_processed['state'] = encoder.transform(X_processed['state'])
+            features = [col for col in ['state', 'sttl', 'ct_state_ttl', 'dload', 'ct_dst_sport_ltm', 
+                      'rate', 'swin', 'dwin', 'dmean', 'ct_src_dport_ltm'] if col in X_processed.columns]
+            X_processed[features] = scaler.transform(X_processed[features])
+        else:
+            # Use the preprocess_data function with label_encoders
+            X_processed = preprocess_data(X)
+        
+        # Make predictions
+        predictions = model.predict(X_processed)
+        
+        try:
+            probabilities = model.predict_proba(X_processed)[:, 1]
+        except:
+            probabilities = predictions.astype(float)
+        
+        # Create result summary
+        normal_count = int(sum(predictions == 0))
+        intrusion_count = int(sum(predictions == 1))
+        total_count = len(predictions)
+        
+        summary = {
+            'total_connections': total_count,
+            'normal_connections': normal_count,
+            'intrusion_connections': intrusion_count,
+            'intrusion_percentage': float(round(intrusion_count / total_count * 100, 2))
         }
-    }
+        
+        # If we have true labels, calculate accuracy
+        if y_true is not None:
+            accuracy = (predictions == y_true).mean() * 100
+            summary['accuracy'] = float(round(accuracy, 2))
+        
+        # Clean up temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+        
+        logger.info(f"Prediction completed for {file.filename}")
+        
+        return {
+            'success': True,
+            'result_counts': {
+                'Normal': normal_count,
+                'Intrusion': intrusion_count
+            },
+            'summary': summary,
+            'predictions': predictions.tolist(),
+            'probabilities': probabilities.tolist()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = f"Prediction error: {str(e)}"
+        logger.error(f"ERROR: {error_msg}")
+        
+        # Cleanup
+        if 'temp_file' in locals() and os.path.exists(temp_file):
+            os.remove(temp_file)
+        
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/debug")
 async def debug_info():
@@ -370,5 +593,49 @@ async def debug_info():
         "scaler_exists": Path("./scaler.pkl").exists(),
         "model_loaded": model is not None,
         "encoder_loaded": encoder is not None,
-        "scaler_loaded": scaler is not None
+        "scaler_loaded": scaler is not None,
+        "model_type": str(type(model)) if model is not None else "None",
     }
+
+# Error handler
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Global exception: {str(exc)}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Internal server error: {str(exc)}"}
+    )
+
+# API documentation endpoint
+@app.get("/api/docs")
+async def api_documentation():
+    """Returns API usage documentation"""
+    return {
+        "endpoints": {
+            "/": "API status check",
+            "/health": "Health check endpoint",
+            "/interfaces": "List available network interfaces",
+            "/detect": "Start real-time DDoS detection (POST, requires API key)",
+            "/status/{capture_id}": "Get status of a detection job",
+            "/predict_csv": "Upload CSV for prediction (POST, requires API key)",
+            "/debug": "Debug information for troubleshooting",
+            "/api/docs": "API documentation (this endpoint)"
+        },
+        "authentication": {
+            "method": "API Key in header",
+            "header_name": "X-API-Key",
+            "example": {
+                "headers": {
+                    "X-API-Key": "your-api-key-here"
+                }
+            }
+        },
+        "usage_example": {
+            "curl": 'curl -X POST "http://api-url/predict_csv" -H "X-API-Key: your-api-key" -F "file=@your-file.csv"'
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
