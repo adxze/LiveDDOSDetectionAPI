@@ -223,7 +223,7 @@ async def capture_network_traffic(capture_id: str, interface: str, duration: int
             "message":str(e),
             "end_time":time.time()
         }
-        logger.error(f"Capture {capture_id} failed: {e}")
+        logger.exception(f"Capture {capture_id} failed")
 
 # -----------------------------------------------------------------------------
 # Endpoints (unchanged from before)
