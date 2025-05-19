@@ -534,8 +534,11 @@ async def predict_csv(
     # Generate a unique ID for this task
     capture_id = str(uuid.uuid4())
     
-    # Create temporary file to store uploaded CSV
-    temp_file = os.path.join(tempfile.gettempdir(), f"{capture_id}_{file.filename}")
+    # Create temp file for CSV with safe filename handling
+    temp_dir = tempfile.gettempdir()
+    safe_filename = f"{capture_id}_upload.csv"
+    temp_file = os.path.join(temp_dir, safe_filename)
+    
     
     # Save the uploaded file
     try:
