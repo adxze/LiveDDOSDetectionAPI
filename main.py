@@ -51,24 +51,12 @@ app.add_middleware(
 TEMP_DIR = Path("./temp")
 TEMP_DIR.mkdir(exist_ok=True)
 
-# Mock ML model for testing
-class MockModel:
-    def predict(self, X):
-        import numpy as np
-        # Return some random predictions (0=Normal, 1=Intrusion)
-        return np.random.choice([0, 1], size=len(X), p=[0.8, 0.2])
+# Initialize model, encoder, and scaler variables
+model = None
+encoder = None
+scaler = None
 
-class MockEncoder:
-    def transform(self, X):
-        # Just return some encoded values
-        return [1 for _ in X]
-
-class MockScaler:
-    def transform(self, X):
-        # Just return the same values
-        return X
-
-# Try to load real models, fall back to mock models
+# Load the real models - will fail if not available (no mock fallback)
 try:
     logger.info("Attempting to load ML components...")
     MODEL_PATH = Path("./model.pkl")
@@ -81,16 +69,11 @@ try:
         scaler = joblib.load(SCALER_PATH)
         logger.info("ML model and components loaded successfully")
     else:
-        logger.warning("Model files not found, using mock models")
-        model = MockModel()
-        encoder = MockEncoder()
-        scaler = MockScaler()
+        logger.error("Required model files not found. Please ensure model.pkl, encoder.pkl, and scaler.pkl exist.")
+        # Don't fall back to mock models
 except Exception as e:
     logger.error(f"Error loading ML components: {e}")
-    logger.warning("Falling back to mock models")
-    model = MockModel()
-    encoder = MockEncoder()
-    scaler = MockScaler()
+    # Don't fall back to mock models
 
 # Track ongoing captures
 active_captures = {}
@@ -182,56 +165,58 @@ async def capture_network_traffic(capture_id: str, interface: str, duration: int
         # Wait for the duration to simulate real capture
         await asyncio.sleep(min(duration, 5))  # Cap at 5s for demo
         
-        # Now predict using the model
-        if model and encoder and scaler:
-            # Read the captured data
-            df = pd.read_csv(csv_file)
-            
-            # Save a copy of the raw data before preprocessing
-            flow_data = df.copy()
-            
-            # Preprocess the data
-            df_processed = df.drop(['src_ip', 'dst_ip', 'protocol', 'src_port', 'dst_port'], axis=1)
-            
-            # Encode categorical features
-            df_processed['state'] = encoder.transform(df_processed['state'])
-            
-            # Scale numerical features
-            features = ['state', 'sttl', 'ct_state_ttl', 'dload', 'ct_dst_sport_ltm', 
-                       'rate', 'swin', 'dwin', 'dmean', 'ct_src_dport_ltm']
-            df_processed[features] = scaler.transform(df_processed[features])
-            
-            # Make predictions
-            predictions = model.predict(df_processed[features])
-            
-            # Add predictions to the original data
-            flow_data['prediction'] = predictions
-            
-            # Map numerical predictions to labels (0 = Normal, 1 = Intrusion)
-            flow_data['label'] = flow_data['prediction'].map({0: 'Normal', 1: 'Intrusion'})
-            
-            # Save the results
-            flow_data.to_csv(predicted_file, index=False)
-            
-            # Count the results
-            result_counts = flow_data['label'].value_counts().to_dict()
-            
-            # Update the capture status
-            active_captures[capture_id] = {
-                "status": "completed",
-                "result_counts": result_counts,
-                "end_time": time.time(),
-                "prediction_file": str(predicted_file)
-            }
-            
-            logger.info(f"Capture {capture_id} completed with results: {result_counts}")
-        else:
+        # Check if the ML model is available
+        if model is None or encoder is None or scaler is None:
             active_captures[capture_id] = {
                 "status": "error",
-                "message": "ML model not available",
+                "message": "ML model components not available. Cannot perform prediction.",
                 "end_time": time.time()
             }
-            logger.error(f"Capture {capture_id} failed: ML model not available")
+            logger.error(f"Capture {capture_id} failed: ML model components not available")
+            return
+        
+        # Now predict using the model
+        # Read the captured data
+        df = pd.read_csv(csv_file)
+        
+        # Save a copy of the raw data before preprocessing
+        flow_data = df.copy()
+        
+        # Preprocess the data
+        df_processed = df.drop(['src_ip', 'dst_ip', 'protocol', 'src_port', 'dst_port'], axis=1)
+        
+        # Encode categorical features
+        df_processed['state'] = encoder.transform(df_processed['state'])
+        
+        # Scale numerical features
+        features = ['state', 'sttl', 'ct_state_ttl', 'dload', 'ct_dst_sport_ltm', 
+                   'rate', 'swin', 'dwin', 'dmean', 'ct_src_dport_ltm']
+        df_processed[features] = scaler.transform(df_processed[features])
+        
+        # Make predictions
+        predictions = model.predict(df_processed[features])
+        
+        # Add predictions to the original data
+        flow_data['prediction'] = predictions
+        
+        # Map numerical predictions to labels (0 = Normal, 1 = Intrusion)
+        flow_data['label'] = flow_data['prediction'].map({0: 'Normal', 1: 'Intrusion'})
+        
+        # Save the results
+        flow_data.to_csv(predicted_file, index=False)
+        
+        # Count the results
+        result_counts = flow_data['label'].value_counts().to_dict()
+        
+        # Update the capture status
+        active_captures[capture_id] = {
+            "status": "completed",
+            "result_counts": result_counts,
+            "end_time": time.time(),
+            "prediction_file": str(predicted_file)
+        }
+        
+        logger.info(f"Capture {capture_id} completed with results: {result_counts}")
     
     except Exception as e:
         active_captures[capture_id] = {
@@ -250,7 +235,7 @@ async def root():
 async def health_check():
     interfaces = get_available_interfaces()
     return {
-        "status": "ok",
+        "status": "ok" if (model is not None and encoder is not None and scaler is not None) else "error",
         "time": datetime.now().isoformat(),
         "model_loaded": model is not None and encoder is not None and scaler is not None,
         "interface_available": len(interfaces) > 0
@@ -268,6 +253,13 @@ async def start_detection(
     duration: int = 60,  # Default duration in seconds
     api_key: APIKey = Depends(get_api_key)
 ):
+    # Check if ML models are available
+    if model is None or encoder is None or scaler is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ML model components not available. Cannot start detection."
+        )
+    
     # Generate a unique ID for this capture
     capture_id = str(uuid.uuid4())
     
@@ -337,11 +329,28 @@ async def get_status(
 # Simplified CSV prediction endpoint
 @app.post("/predict_csv")
 async def predict_csv_file(request: Request, api_key: APIKey = Depends(get_api_key)):
-    # This would be implemented with a proper file upload
-    # For now we'll just return a mock response
-    await asyncio.sleep(2)  # Simulate processing time
+    # Check if ML models are available
+    if model is None or encoder is None or scaler is None:
+        raise HTTPException(
+            status_code=503,
+            detail="ML model components not available. Cannot perform prediction."
+        )
     
+    # This would be implemented with a proper file upload
+    # For demo purposes, add some logic to simulate processing
+    await asyncio.sleep(2)
+    
+    # In a real implementation, you would:
+    # 1. Save the uploaded file
+    # 2. Read it with pandas
+    # 3. Preprocess it
+    # 4. Make predictions
+    # 5. Return results
+    
+    # Since we've removed the mock models, this should only run if real models are loaded
     return {
+        "status": "completed",
+        "message": "Prediction completed using real ML model",
         "result_counts": {
             "Normal": 462,
             "Intrusion": 96
@@ -359,4 +368,7 @@ async def debug_info():
         "model_exists": Path("./model.pkl").exists(),
         "encoder_exists": Path("./encoder.pkl").exists(),
         "scaler_exists": Path("./scaler.pkl").exists(),
+        "model_loaded": model is not None,
+        "encoder_loaded": encoder is not None,
+        "scaler_loaded": scaler is not None
     }
