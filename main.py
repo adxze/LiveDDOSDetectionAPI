@@ -77,6 +77,7 @@ class DetectionResult(Base):
     os = Column(String)
     result_json = Column(sqlalchemy.JSON)
     is_critical = Column(Boolean, default=False)
+    attack_type = Column(String(50))
 
 # Initialize database engine
 engine = create_engine(DATABASE_URL)
@@ -131,10 +132,10 @@ async def save_detection_result(capture_id, metadata, result_counts):
         query = """
         INSERT INTO detection_results (
             capture_id, hostname, location, timestamp, status,
-            normal_count, intrusion_count, os, result_json, is_critical
+            normal_count, intrusion_count, os, result_json, is_critical, attack_type
         ) VALUES (
             :capture_id, :hostname, :location, :timestamp, :status,
-            :normal_count, :intrusion_count, :os, :result_json, :is_critical
+            :normal_count, :intrusion_count, :os, :result_json, :is_critical, :attack_type
         )
         """
         
@@ -147,15 +148,94 @@ async def save_detection_result(capture_id, metadata, result_counts):
             "normal_count": result_counts.get("Normal", 0),
             "intrusion_count": result_counts.get("Intrusion", 0),
             "os": metadata.get("os", "unknown"),
-            "result_json": json.dumps(result_counts),  # Convert dict to JSON string,
-            "is_critical": is_critical
+            "result_json": json.dumps(result_counts),  # Convert dict to JSON string
+            "is_critical": is_critical,
+            "attack_type": metadata.get("attack_type", "Unknown")
         }
         
         await database.execute(query=query, values=values)
-        logger.info(f"Detection result for {capture_id} saved to database")
+        logger.info(f"Detection result for {capture_id} saved to database with attack type: {metadata.get('attack_type', 'Unknown')}")
     
     except Exception as e:
         logger.error(f"Error saving to database: {str(e)}")
+
+def detect_attack_type(csv_path):
+    """
+    Analyze network traffic to determine the DDoS attack type.
+    """
+    try:
+        # Load CSV data
+        df = pd.read_csv(csv_path)
+        
+        # Initialize counters
+        tcp_syn_count = 0
+        udp_count = 0
+        http_count = 0
+        icmp_count = 0
+        
+        # Count protocol distributions
+        if 'protocol' in df.columns:
+            df['protocol'] = df['protocol'].astype(str).str.lower()
+            protocol_counts = df['protocol'].value_counts()
+            tcp_count = protocol_counts.get('tcp', 0)
+            udp_count = protocol_counts.get('udp', 0)
+        
+        # Count TCP states for SYN Flood detection
+        if 'state' in df.columns:
+            state_counts = df['state'].astype(str).value_counts()
+            tcp_syn_count = state_counts.get('REQ', 0) + state_counts.get('SYN', 0)
+        
+        # Count destination ports for HTTP Flood detection
+        if 'dst_port' in df.columns:
+            df['dst_port'] = pd.to_numeric(df['dst_port'], errors='coerce')
+            port_counts = df['dst_port'].value_counts()
+            http_count = port_counts.get(80, 0) + port_counts.get(443, 0)
+        
+        # Count ICMP for ICMP Flood detection
+        if 'protocol' in df.columns:
+            icmp_count = len(df[df['protocol'].str.lower() == 'icmp'])
+        
+        # Determine attack type based on thresholds
+        total_packets = len(df)
+        
+        if total_packets == 0:
+            return "Unknown"
+        
+        # Calculate percentages
+        syn_percent = (tcp_syn_count / total_packets) * 100 if total_packets > 0 else 0
+        udp_percent = (udp_count / total_packets) * 100 if total_packets > 0 else 0
+        http_percent = (http_count / total_packets) * 100 if total_packets > 0 else 0
+        icmp_percent = (icmp_count / total_packets) * 100 if total_packets > 0 else 0
+        
+        # Determine the predominant attack type
+        attack_types = []
+        
+        if syn_percent > 30:
+            attack_types.append(("SYN Flood", syn_percent))
+        
+        if udp_percent > 50:
+            attack_types.append(("UDP Flood", udp_percent))
+        
+        if http_percent > 50:
+            attack_types.append(("HTTP Flood", http_percent))
+        
+        if icmp_percent > 30:
+            attack_types.append(("ICMP Flood", icmp_percent))
+        
+        # If multiple attack types, use the dominant one
+        if len(attack_types) > 1:
+            attack_types.sort(key=lambda x: x[1], reverse=True)
+            return attack_types[0][0]
+        elif len(attack_types) == 1:
+            return attack_types[0][0]
+        else:
+            # If no specific attack type is dominant but intrusions exist
+            return "Mixed / Generic DDoS"
+    
+    except Exception as e:
+        logger.error(f"Error detecting attack type: {str(e)}")
+        return "Unknown"
+
 
 # Pydantic models for API requests/responses
 class DetectionRequest(BaseModel):
@@ -172,6 +252,7 @@ class StatusResponse(BaseModel):
     message: str
     result_counts: Optional[Dict[str, int]] = None
     progress: Optional[int] = None
+    attack_type: Optional[str] = "Unknown"
 
 # Download model files at startup
 async def download_models():
@@ -373,6 +454,10 @@ async def predict_from_csv(model_path, encoder_path, scaler_path, csv_path, capt
 
         logger.info(f"Loading model and processing {csv_path}")
         
+        # Detect attack type - ADD THIS NEAR THE BEGINNING
+        attack_type = detect_attack_type(csv_path)
+        logger.info(f"Detected attack type: {attack_type}")
+        
         # Load the model, encoder, and scaler
         model = joblib.load(model_path)
         encoder = joblib.load(encoder_path)
@@ -425,15 +510,17 @@ async def predict_from_csv(model_path, encoder_path, scaler_path, csv_path, capt
         if "Intrusion" not in result_counts:
             result_counts["Intrusion"] = 0
         
-        # Update task status with results
+        # Update task status with results AND ATTACK TYPE - MODIFY THIS SECTION
         detection_tasks[capture_id]["result_counts"] = result_counts
+        detection_tasks[capture_id]["attack_type"] = attack_type  # ADD THIS LINE
         
-        # Save results to the database
+        # Save results to the database WITH ATTACK TYPE - MODIFY THIS SECTION
         if metadata is None:
             metadata = {}
+        metadata["attack_type"] = attack_type  # ADD THIS LINE
         await save_detection_result(capture_id, metadata, result_counts)
         
-        logger.info(f"Prediction completed with results: {result_counts}")
+        logger.info(f"Prediction completed with results: {result_counts}, attack type: {attack_type}")  # MODIFY THIS LOG LINE
         return result_counts
         
     except Exception as e:
@@ -586,7 +673,8 @@ async def get_status(capture_id: str):
         status=task["status"],
         message=task["message"],
         result_counts=task["result_counts"],
-        progress=task["progress"]
+        progress=task["progress"],
+        attack_type=task.get("attack_type", "Unknown")  # Add this line
     )
 
 @app.get("/results", dependencies=[Depends(verify_api_key)])
