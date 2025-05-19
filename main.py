@@ -73,7 +73,8 @@ async def debug_info():
             "tip3": "If model exists but size is small, it might be a placeholder or corrupt file",
             "tip4": "Try uploading model files directly using the /upload_model endpoint"
         }
-    }"import os
+    }
+import os
 import logging
 import requests
 import sys
