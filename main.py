@@ -392,6 +392,10 @@ async def startup_event():
 
 @app.post("/detect", response_model=DetectionResponse, dependencies=[Depends(verify_api_key)])
 async def start_detection(request: DetectionRequest, background_tasks: BackgroundTasks):
+    """
+    This endpoint is kept for API compatibility, but for actual network capture,
+    we recommend using the local capture client which sends data to the /predict_csv endpoint.
+    """
     capture_id = str(uuid.uuid4())
     
     # Initialize task tracking
