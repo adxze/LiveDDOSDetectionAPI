@@ -49,6 +49,9 @@ SCALER_PATH = os.path.join(MODEL_DIR, "scaler.pkl")
 API_KEY = os.environ.get("API_KEY", "this-is-api-key-lol")
 api_key_header = APIKeyHeader(name="X-API-Key")
 
+# Data retention configuration - 3 months = 2160 hours
+DATA_RETENTION_HOURS = int(os.environ.get("DATA_RETENTION_HOURS", "2160"))
+
 # Dictionary to track ongoing detection tasks
 detection_tasks = {}
 
@@ -95,16 +98,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Function to clean up old data (older than 24 hours)
+# Function to clean up old data (configurable retention period)
 async def cleanup_old_data():
     while True:
         try:
-            logger.info("Running scheduled cleanup of old detection data")
-            one_day_ago = datetime.utcnow() - timedelta(days=1)
+            logger.info(f"Running scheduled cleanup of old detection data (retention: {DATA_RETENTION_HOURS} hours)")
+            cutoff_time = datetime.utcnow() - timedelta(hours=DATA_RETENTION_HOURS)
             
             # Proper SQL query for databases package
             query = "DELETE FROM detection_results WHERE timestamp < :old_time"
-            await database.execute(query=query, values={"old_time": one_day_ago})
+            await database.execute(query=query, values={"old_time": cutoff_time})
             
             logger.info("Cleanup completed")
         except Exception as e:
